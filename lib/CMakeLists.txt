@@ -12,6 +12,7 @@ set(LLVM_TUTOR_PLUGINS
     DuplicateBB
     OpcodeCounter
     MergeBB
+    BoundedSLP
     )
 
 set(StaticCallCounter_SOURCES
@@ -36,16 +37,30 @@ set(OpcodeCounter_SOURCES
   OpcodeCounter.cpp)
 set(MergeBB_SOURCES
   MergeBB.cpp)
+set(BoundedSLP_SOURCES
+  BoundedSLP.cpp)
 
 # CONFIGURE THE PLUGIN LIBRARIES
 # ==============================
 foreach( plugin ${LLVM_TUTOR_PLUGINS} )
-    # Create a library corresponding to 'plugin'
-    add_library(
-      ${plugin}
-      SHARED
-      ${${plugin}_SOURCES}
-      )
+    if(WIN32 AND plugin STREQUAL "BoundedSLP")
+      add_executable(
+        ${plugin}
+        ${${plugin}_SOURCES}
+        "${CMAKE_CURRENT_SOURCE_DIR}/../tools/BoundedSLPDriver.cpp"
+        )
+      llvm_map_components_to_libnames(BOUNDED_SLP_LLVM_LIBS
+        Core Analysis IRReader nativecodegen Passes)
+      target_link_libraries(${plugin} ${BOUNDED_SLP_LLVM_LIBS})
+      set_target_properties(${plugin} PROPERTIES OUTPUT_NAME "slp-opt")
+    else()
+      # Create a library corresponding to 'plugin'
+      add_library(
+        ${plugin}
+        SHARED
+        ${${plugin}_SOURCES}
+        )
+    endif()
 
     # Configure include directories for 'plugin'
     target_include_directories(

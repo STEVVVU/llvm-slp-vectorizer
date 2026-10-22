@@ -1,0 +1,82 @@
+name: bounded-slp
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-llvm-23:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Add the official LLVM apt repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          key="$RUNNER_TEMP/apt.llvm.org.asc"
+          curl --fail --location --retry 3 https://apt.llvm.org/llvm-snapshot.gpg.key --output "$key"
+          fingerprint=$(gpg --show-keys --with-colons "$key" | awk -F: '$1 == "fpr" { print $10; exit }')
+          test "$fingerprint" = 6084F3CF814B57C1CF12EFD515CF4D18AF4F7421
+          sudo install -d -m 0755 /etc/apt/keyrings
+          gpg --dearmor --output "$RUNNER_TEMP/apt.llvm.org.gpg" "$key"
+          sudo install -m 0644 "$RUNNER_TEMP/apt.llvm.org.gpg" /etc/apt/keyrings/apt.llvm.org.gpg
+          echo 'deb [signed-by=/etc/apt/keyrings/apt.llvm.org.gpg] https://apt.llvm.org/noble/ llvm-toolchain-noble-23 main' \
+            | sudo tee /etc/apt/sources.list.d/llvm23.list >/dev/null
+          sudo apt-get update
+
+      - name: Install pinned LLVM 23.1.4 development packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          version='1:23.1.4~++20261020011024+7a941dfb2877-1~exp1~20261020131035.87'
+          for package in llvm-23-dev llvm-23-tools llvm-23; do
+            apt-cache show "$package" | grep -Fqx "Version: $version"
+          done
+          sudo apt-get install --yes \
+            "llvm-23-dev=$version" \
+            "llvm-23-tools=$version" \
+            "llvm-23=$version" \
+            cmake ninja-build g++
+          test "$(/usr/lib/llvm-23/bin/llvm-config --version)" = 23.1.4
+          test -x /usr/lib/llvm-23/bin/opt
+          test -x /usr/lib/llvm-23/bin/FileCheck
+          test -f /usr/lib/llvm-23/lib/cmake/llvm/LLVMConfig.cmake
+
+      - name: Build pass plugin
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S . -B build/ci -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLT_LLVM_INSTALL_DIR=/usr/lib/llvm-23 \
+            -DLLVM_DIR=/usr/lib/llvm-23/lib/cmake/llvm
+          cmake --build build/ci --target BoundedSLP
+
+      - name: Verify IR packing and native SIMD lowering
+        shell: bash
+        run: |
+          set -euo pipefail
+          export LD_LIBRARY_PATH="/usr/lib/llvm-23/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          plugin="$PWD/build/ci/lib/libBoundedSLP.so"
+          /usr/lib/llvm-23/bin/opt -load-pass-plugin "$plugin" \
+            -passes=bounded-slp -verify-each -S test/BoundedSLP.ll \
+            -o build/ci/BoundedSLP.exact.ll
+          /usr/lib/llvm-23/bin/FileCheck test/BoundedSLP.ll \
+            --check-prefix=EXACT < build/ci/BoundedSLP.exact.ll
+          /usr/lib/llvm-23/bin/opt -load-pass-plugin "$plugin" \
+            -passes=bounded-slp-greedy -verify-each -S test/BoundedSLP.ll \
+            -o build/ci/BoundedSLP.greedy.ll
+          /usr/lib/llvm-23/bin/FileCheck test/BoundedSLP.ll \
+            --check-prefix=GREEDY < build/ci/BoundedSLP.greedy.ll
+          /usr/lib/llvm-23/bin/llc -O2 -mattr=+sse2 -filetype=asm \
+            build/ci/BoundedSLP.exact.ll -o build/ci/BoundedSLP.s
+          grep -Eq '\bpaddd\b' build/ci/BoundedSLP.s

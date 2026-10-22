@@ -1,0 +1,35 @@
+{
+  "captured_at_utc": "2026-10-21T21:39:18Z",
+  "source_revision": "49e322c602fd64838964b77c5ea109d6667048f8",
+  "platform": "Windows x64, Visual Studio 2022 MSVC 14.44",
+  "llvm_version": "23.1.4",
+  "workflow": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/verify.ps1 -Phase All",
+  "checks": {
+    "launch": "passed",
+    "doctor": "passed; 22.76 GB free",
+    "drive": "passed",
+    "evidence": "passed",
+    "cleanup": "passed; build/verify removed and evidence retained",
+    "post_transform_llvm_verifier": "passed",
+    "native_differential_arithmetic_inputs": 65600,
+    "native_pointer_alias_cases": 8
+  },
+  "transformation": {
+    "exact_vector_adds": 6,
+    "greedy_vector_adds": 5,
+    "exact_search_candidates": 16,
+    "exact_search_elapsed_ms": 16.767
+  },
+  "native_output": {
+    "target": "x86_64-pc-windows-msvc",
+    "llc_flags": "-O2 -mattr=+sse2",
+    "packed_add_instruction": "paddd"
+  },
+  "interleaved_benchmark_ns_per_call": {
+    "rounds": 9,
+    "scalar_median": 1.46646,
+    "transformed_median": 1.21037,
+    "interpretation": "single local sample; not a general speedup claim"
+  },
+  "raw_evidence_directory": ".verify/evidence/20261021-213918-883"
+}
