@@ -20,6 +20,8 @@ The observable end state is valid transformed IR with two packed adds in `packin
 
 ## Gotchas
 
+The maintained `scripts/benchmark.py` prepares eight deterministic scalar-IR kernels. On the pinned Linux runner, `--run` compares scalar, bounded exact, greedy and upstream LLVM SLP through the same SSE2 native backend at 16K, 1M and 8M outputs. Seven rotated repeats retain per-element runtime, pass/codegen time, object/text size, checksums and independent full-output checks. `test/benchmark_native.cpp --smoke` performs untimed correctness checks. Workflow dispatch runs this campaign and retains `.verify/benchmark/`. A separate perf counter attempt records failures explicitly; unavailable counters do not establish a hardware limiter. This new campaign remains draft until its first successful hosted run.
+
 - Scalar constant pairs are emitted as vector instructions without IRBuilder constant folding the operation into a `Constant`; otherwise there is no instruction to replace the original scalar operations.
 - The target arithmetic cost comparison excludes lane construction and extraction costs. It is a bounded selection heuristic, not a complete profitability model.
 - Exact-search evidence only characterizes the 16-candidate bound. Above that count the pass uses greedy pairing.

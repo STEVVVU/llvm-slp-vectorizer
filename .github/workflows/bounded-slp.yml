@@ -80,3 +80,20 @@ jobs:
           /usr/lib/llvm-23/bin/llc -O2 -mattr=+sse2 -filetype=asm \
             build/ci/BoundedSLP.exact.ll -o build/ci/BoundedSLP.s
           grep -Eq '\bpaddd\b' build/ci/BoundedSLP.s
+
+      - name: Frozen native kernel benchmark
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        run: |
+          set -euo pipefail
+          export LD_LIBRARY_PATH="/usr/lib/llvm-23/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          python3 scripts/benchmark.py --run
+
+      - name: Retain raw benchmark and diagnostic evidence
+        if: always() && github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: native-slp-benchmark
+          path: .verify/benchmark/
+          include-hidden-files: true
+          if-no-files-found: error
