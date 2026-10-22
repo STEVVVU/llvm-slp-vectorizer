@@ -45,6 +45,7 @@ def workload():
 
 
 def run(command, **kwargs):
+    kwargs.setdefault("stderr", subprocess.PIPE)
     return subprocess.run(list(map(str, command)), check=True, timeout=kwargs.pop("timeout", 120), **kwargs)
 
 

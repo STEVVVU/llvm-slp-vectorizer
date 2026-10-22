@@ -108,7 +108,7 @@ function Invoke-Drive {
   Assert-Condition ($LASTEXITCODE -eq 0) "Greedy pass failed: $greedyLog"
   $exactCount = (Select-String -Path $exact -Pattern 'add <2 x i32>' | Measure-Object).Count
   $greedyCount = (Select-String -Path $greedy -Pattern 'add <2 x i32>' | Measure-Object).Count
-  Assert-Condition ($exactCount -eq 6 -and $greedyCount -eq 5) "Unexpected vector add counts, exact=$exactCount greedy=$greedyCount."
+  Assert-Condition ($exactCount -eq 5 -and $greedyCount -eq 5) "Unexpected vector add counts, exact=$exactCount greedy=$greedyCount."
   $exactText = Get-Content -Raw $exact
   $mismatchBody = [regex]::Match($exactText, '(?ms)^define i32 @mismatched_flags.*?^}')
   $floatBody = [regex]::Match($exactText, '(?ms)^define float @float_not_packed.*?^}')

@@ -1,4 +1,4 @@
-; Run the exact packer; the dependent/instruction-order fixture admits two pairs.
+; Computed scalar operands must pay their target lane-insertion costs.
 ; RUN: opt -load-pass-plugin %shlibdir/libBoundedSLP%shlibext -passes=bounded-slp -verify-each -S %s | FileCheck %s --check-prefix=EXACT
 ; RUN: opt -load-pass-plugin %shlibdir/libBoundedSLP%shlibext -passes=bounded-slp-greedy -verify-each -S %s | FileCheck %s --check-prefix=GREEDY
 
@@ -69,8 +69,17 @@ define float @float_not_packed(float %a, float %b, float %c, float %d) {
   ret float %sum
 }
 
+define i32 @computed_lane_cost(i32 %a, i32 %b, i32 %c, i32 %d) {
+  %x0 = mul i32 %a, %b
+  %x1 = mul i32 %c, %d
+  %y0 = add i32 %x0, 17
+  %y1 = add i32 %x1, 17
+  %result = xor i32 %y0, %y1
+  ret i32 %result
+}
+
 ; EXACT-LABEL: define i32 @packing_shape
-; EXACT-COUNT-2: add <2 x i32>
+; EXACT-COUNT-1: add <2 x i32>
 ; GREEDY-LABEL: define i32 @packing_shape
 ; GREEDY-COUNT-1: add <2 x i32>
 ; EXACT-LABEL: define i32 @slp_add2
@@ -86,3 +95,7 @@ define float @float_not_packed(float %a, float %b, float %c, float %d) {
 ; EXACT-NOT: add <2 x i32>
 ; EXACT-LABEL: define float @float_not_packed
 ; EXACT-NOT: fadd <2 x float>
+; EXACT-LABEL: define i32 @computed_lane_cost
+; EXACT-NOT: add <2 x i32>
+; GREEDY-LABEL: define i32 @computed_lane_cost
+; GREEDY-NOT: add <2 x i32>

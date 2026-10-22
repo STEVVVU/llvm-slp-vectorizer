@@ -57,7 +57,20 @@ int64_t arithmeticSavings(const Pair &P, const TargetTransformInfo &TTI) {
   auto Vector = TTI.getArithmeticInstrCost(Opcode, VectorTy);
   if (!Scalar.isValid() || !Vector.isValid())
     return 0;
-  return 2 * Scalar.getValue() - Vector.getValue();
+  int64_t Savings = 2 * Scalar.getValue() - Vector.getValue();
+  for (unsigned Operand = 0; Operand != 2; ++Operand)
+    for (unsigned Lane = 0; Lane != 2; ++Lane) {
+      Value *Input = (Lane == 0 ? P.first : P.second)->getOperand(Operand);
+      if (!isa<Instruction>(Input) || isa<LoadInst>(Input))
+        continue;
+      // Scalar producers need lane materialization; adjacent loads can fold in native lowering.
+      auto Insert = TTI.getVectorInstrCost(Instruction::InsertElement, VectorTy,
+                                          TTI::TCK_RecipThroughput, Lane, Input);
+      if (!Insert.isValid())
+        return 0;
+      Savings -= Insert.getValue();
+    }
+  return Savings;
 }
 
 // Packing candidates are equivalent pairs; the exact search maximizes packed
