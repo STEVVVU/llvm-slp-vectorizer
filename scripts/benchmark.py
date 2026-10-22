@@ -59,6 +59,7 @@ def main():
     parser.add_argument("--llvm", type=Path, default=Path("/usr/lib/llvm-23/bin"))
     parser.add_argument("--plugin", type=Path, default=ROOT / "build/ci/lib/libBoundedSLP.so")
     parser.add_argument("--output", type=Path, default=ROOT / ".verify/benchmark")
+    parser.add_argument("--before-ref", choices=["66b66ba2e86640a8f96bfc5d0299461b10513c29"])
     args = parser.parse_args()
     if shutil.disk_usage(ROOT).free < 10 * 1024**3:
         raise RuntimeError("10 GiB free disk required")
@@ -76,26 +77,43 @@ def main():
     version = subprocess.check_output([args.llvm / "llvm-config", "--version"], text=True).strip()
     if version != "23.1.4":
         raise RuntimeError(f"Expected LLVM 23.1.4, found {version}")
+    sides = dict(SIDES)
+    plugins = {"bounded": args.plugin, "greedy": args.plugin}
+    before_source = None
+    if args.before_ref:
+        before_source = ROOT / "build/benchmark-before-source"
+        before_source.mkdir(parents=True, exist_ok=False)
+        archive = ROOT / "build/benchmark-before.tar"
+        with archive.open("wb") as stream:
+            run(["git", "archive", args.before_ref], cwd=ROOT, stdout=stream)
+        run(["tar", "-xf", archive, "-C", before_source])
+        before_build = ROOT / "build/benchmark-before"
+        run(["cmake", "-S", before_source, "-B", before_build, "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release", "-DLT_LLVM_INSTALL_DIR=/usr/lib/llvm-23", "-DLLVM_DIR=/usr/lib/llvm-23/lib/cmake/llvm"])
+        run(["cmake", "--build", before_build, "--target", "BoundedSLP"], timeout=300)
+        sides["before"] = "bounded-slp"
+        plugins["before"] = before_build / "lib/libBoundedSLP.so"
     record = {"source_sha": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(), "workload_sha256": hashlib.sha256(source.read_bytes()).hexdigest(), "llvm": version, "platform": platform.platform(), "cpu": subprocess.check_output(["lscpu"], text=True), "load": os.getloadavg(), "cpus": os.cpu_count(), "workloads": KERNELS, "sizes": [16384, 1048576, 8388608], "scope": "fixed unrolled integer array kernels, common llc O3 x86-64 SSE2 backend; scalar disables IR vectorizers, upstream uses LLVM SLP; not a general application/compiler adoption result", "compile": {}}
     run(["g++", "-O3", "-std=c++17", ROOT / "test/benchmark_native.cpp", "-ldl", "-o", args.output / "native-suite"])
     libraries = []
-    for name in SIDES:
+    record["before_ref"] = args.before_ref
+    record["source_and_plugin_sha256"] = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in [ROOT / "lib/BoundedSLP.cpp", args.plugin] + ([before_source / "lib/BoundedSLP.cpp", plugins["before"]] if before_source else [])}
+    for name in sides:
         record["compile"][name] = {"opt_ms": [], "codegen_ms": []}
     for repeat in range(7):
-        names = list(SIDES)
+        names = list(sides)
         names = names[repeat % len(names):] + names[:repeat % len(names)]
         for name in names:
             target = args.output / f"{name}.ll"
-            command = [opt, "-S", "-verify-each", f"-passes={SIDES[name]}", source, "-o", target]
-            if name in ("bounded", "greedy"):
-                command += ["-load-pass-plugin", args.plugin]
+            command = [opt, "-S", "-verify-each", f"-passes={sides[name]}", source, "-o", target]
+            if name in plugins:
+                command += ["-load-pass-plugin", plugins[name]]
             start = time.perf_counter()
             run(command, stdout=subprocess.DEVNULL)
             record["compile"][name]["opt_ms"].append((time.perf_counter() - start) * 1000)
             start = time.perf_counter()
             run([llc, "-O3", "-mcpu=x86-64", "-mattr=+sse2", "-relocation-model=pic", "-filetype=obj", target, "-o", args.output / f"{name}.o"])
             record["compile"][name]["codegen_ms"].append((time.perf_counter() - start) * 1000)
-    for name in SIDES:
+    for name in sides:
         library = args.output / f"{name}.so"
         run(["g++", "-shared", args.output / f"{name}.o", "-o", library])
         libraries.append(library.resolve())
@@ -105,6 +123,7 @@ def main():
         if name == "scalar" and re.search(r"\b(?:v?padd\w*|v?psub\w*|v?pmul\w*)\b", (args.output / f"{name}.s").read_text()):
             raise AssertionError("scalar baseline contains packed arithmetic")
         record["compile"][name]["object_bytes"] = (args.output / f"{name}.o").stat().st_size
+        record["compile"][name]["native_library_sha256"] = hashlib.sha256(library.read_bytes()).hexdigest()
         record["compile"][name]["text_size"] = subprocess.check_output([args.llvm / "llvm-size", args.output / f"{name}.o"], text=True)
         for timing in ("opt_ms", "codegen_ms"):
             record["compile"][name][timing] = summary(record["compile"][name][timing])
@@ -116,7 +135,7 @@ def main():
         for row in csv.DictReader(stream):
             key = f"{row['kernel']}/{row['elements']}/{row['side']}"
             grouped.setdefault(key, []).append(float(row["ns_per_element"]))
-    if len(grouped) != len(KERNELS) * 3 * len(SIDES) or any(len(values) != 7 for values in grouped.values()):
+    if len(grouped) != len(KERNELS) * 3 * len(sides) or any(len(values) != 7 for values in grouped.values()):
         raise AssertionError("missing benchmark samples")
     record["runtime_ns_per_element"] = {key: summary(values) for key, values in grouped.items()}
     record["profile"] = {}
