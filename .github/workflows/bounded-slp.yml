@@ -39,7 +39,7 @@ jobs:
           set -euo pipefail
           version='1:23.1.4~++20261020011024+7a941dfb2877-1~exp1~20261020131035.87'
           for package in llvm-23-dev llvm-23-tools llvm-23; do
-            apt-cache show "$package" | grep -Fqx "Version: $version"
+            apt-cache show "$package" | grep -Fx "Version: $version" >/dev/null
           done
           sudo apt-get install --yes \
             "llvm-23-dev=$version" \
