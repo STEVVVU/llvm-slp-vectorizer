@@ -22,7 +22,7 @@ jobs:
       - name: Prepare the pinned official LLVM 23.1.4 SDK
         shell: bash
         run: |
-          set -euo pipefail
+          set -euxo pipefail
           sudo apt-get update
           sudo apt-get install --yes \
             cmake ninja-build g++ zstd zlib1g-dev libzstd-dev libxml2-dev libffi-dev libedit-dev
