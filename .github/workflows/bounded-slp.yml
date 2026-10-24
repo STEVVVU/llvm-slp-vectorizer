@@ -19,34 +19,24 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
-      - name: Add the official LLVM apt repository
+      - name: Prepare the pinned official LLVM 23.1.4 SDK
         shell: bash
         run: |
           set -euo pipefail
-          key="$RUNNER_TEMP/apt.llvm.org.asc"
-          curl --fail --location --retry 3 https://apt.llvm.org/llvm-snapshot.gpg.key --output "$key"
-          fingerprint=$(gpg --show-keys --with-colons "$key" | awk -F: '$1 == "fpr" { print $10; exit }')
-          test "$fingerprint" = 6084F3CF814B57C1CF12EFD515CF4D18AF4F7421
-          sudo install -d -m 0755 /etc/apt/keyrings
-          gpg --dearmor --output "$RUNNER_TEMP/apt.llvm.org.gpg" "$key"
-          sudo install -m 0644 "$RUNNER_TEMP/apt.llvm.org.gpg" /etc/apt/keyrings/apt.llvm.org.gpg
-          echo 'deb [signed-by=/etc/apt/keyrings/apt.llvm.org.gpg] https://apt.llvm.org/noble/ llvm-toolchain-noble-23 main' \
-            | sudo tee /etc/apt/sources.list.d/llvm23.list >/dev/null
           sudo apt-get update
-
-      - name: Install pinned LLVM 23.1.4 development packages
-        shell: bash
-        run: |
-          set -euo pipefail
-          version='1:23.1.4~++20261020011024+7a941dfb2877-1~exp1~20261020131035.87'
-          for package in llvm-23-dev llvm-23-tools llvm-23; do
-            apt-cache show "$package" | grep -Fx "Version: $version" >/dev/null
-          done
           sudo apt-get install --yes \
-            "llvm-23-dev=$version" \
-            "llvm-23-tools=$version" \
-            "llvm-23=$version" \
-            cmake ninja-build g++
+            cmake ninja-build g++ zstd zlib1g-dev libzstd-dev libxml2-dev libffi-dev libedit-dev
+          archive="$RUNNER_TEMP/LLVM-23.1.4-Linux-X64.tar.zst"
+          curl --fail --location --retry 3 \
+            https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.4/LLVM-23.1.4-Linux-X64.tar.zst \
+            --output "$archive"
+          echo "efdd1dbd089b99bfcfcde7b8eb1236163f2e88df5a981cca4f783ec9cb5e0378  $archive" | sha256sum --check
+          sdk="$RUNNER_TEMP/llvm-23.1.4"
+          mkdir "$sdk"
+          tar --use-compress-program='zstd --decompress --long=30' \
+            --extract --file "$archive" --directory "$sdk" --strip-components=1
+          test ! -e /usr/lib/llvm-23
+          sudo ln -s "$sdk" /usr/lib/llvm-23
           test "$(/usr/lib/llvm-23/bin/llvm-config --version)" = 23.1.4
           test -x /usr/lib/llvm-23/bin/opt
           test -x /usr/lib/llvm-23/bin/FileCheck
