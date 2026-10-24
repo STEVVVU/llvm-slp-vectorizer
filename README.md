@@ -2,6 +2,127 @@
 
 This project adds a small, real LLVM function pass for packing independent scalar integer operations into two-lane SIMD operations. It is built on the complete MIT-licensed history of [`llvm-tutor`](https://github.com/banach-space/llvm-tutor), which remains in this repository as the tutorial collection. The exact inherited README is preserved in [`README.upstream.md`](README.upstream.md), and inherited CI workflows are retained byte-for-byte under [`docs/upstream/workflows`](docs/upstream/workflows/).
 
+## Contents
+
+- [Architecture and execution guide](#architecture-and-execution-guide)
+- [What it does](#what-it-does)
+- [Build and run on Windows](#build-and-run-on-windows)
+- [Provenance and design mapping](#provenance-and-design-mapping)
+- [Verification evidence](#verification-evidence)
+- [Verification skill](.agents/skills/verify-bounded-slp/SKILL.md)
+
+## Architecture and execution guide
+
+The project adds a bounded [SLP vectorization](#slp) function pass and standalone driver to the inherited `llvm-tutor` examples. LLVM supplies IR, analyses, target costs, pass infrastructure, and code generation; the new pass selects and rewrites eligible integer operations in a basic block. It is a bounded pair-packing pass, not LLVM's full SLP vectorizer.
+
+```mermaid
+flowchart LR
+  A["LLVM IR input"] --> B["slp-opt driver"]
+  B --> C["Bounded SLP pass"]
+  C --> D["Verified transformed IR"]
+  D --> E["LLVM opt and llc"]
+  E --> F["Native code"]
+```
+
+The driver parses and verifies the module, invokes the pass, verifies its output, and writes IR. LLVM tools then verify and lower the transformed module; plugin registration exists for shared LLVM hosts, while the documented Windows path uses the standalone driver.
+
+```mermaid
+flowchart TD
+  subgraph candidates["Candidate legality and cost"]
+    A["Read function basic block"] --> B["Collect integer add, sub, mul"]
+  B --> C["Check same type, opcode, flags, independence, dominance"]
+  C -->|"illegal"| X["Leave scalar instructions unchanged"]
+  C -->|"legal"| D["Estimate target arithmetic and lane insertion costs"]
+  D -->|"not profitable or invalid cost"| X
+    D -->|"profitable"| E{"Candidate count at most 16?"}
+  end
+  E -->|"yes"| F["Exact subset search"]
+  subgraph packing["Pair selection and rewrite"]
+    E -->|"no"| G["Adjacent greedy pairing"]
+  F --> H["Build two-lane vector operations"]
+  G --> H
+    H --> I["Replace scalar uses and verify IR"]
+  end
+```
+
+[Dominance](#dominance) and other legality checks precede profitability. Exact search is bounded to 16 candidates per block; larger blocks use the greedy fallback. Unsupported or unprofitable operations remain scalar, and the cost estimate omits some construction and extraction costs.
+
+| Subsystem | Responsibility and invariant | Source |
+| --- | --- | --- |
+| Input driver | Parses a module, verifies before and after pass execution, and writes output or returns an error. | [`BoundedSLPDriver.cpp`](tools/BoundedSLPDriver.cpp) |
+| Candidate legality | Requires same operation/type/flags, independence, and operand dominance. | [`BoundedSLP.cpp`](lib/BoundedSLP.cpp) |
+| Cost and pairing | Uses target arithmetic and insertion costs; runs exact search through 16 ops and greedy beyond. | [`BoundedSLP.cpp`](lib/BoundedSLP.cpp) |
+| Vector rewrite | Creates vector operations, extracts scalar lanes, and replaces original uses. | [`BoundedSLP.cpp`](lib/BoundedSLP.cpp) |
+| LLVM integration | Registers pass names for LLVM's new pass manager. | [`BoundedSLP.cpp`](lib/BoundedSLP.cpp), [`BoundedSLP.h`](include/BoundedSLP.h) |
+
+The compilation journey is:
+
+1. Pass LLVM IR to `slp-opt.exe`. The driver rejects unreadable input and invalid IR before running any transformation.
+2. The pass groups eligible independent integer arithmetic in each basic block. It checks operation flags and dominance before considering target cost.
+3. For up to 16 candidates, exact mode maximizes estimated savings and uses insertion cost as a tie-breaker. Larger groups use adjacent greedy pairing; `--greedy` selects that baseline directly.
+4. Profitable pairs become two-lane vector operations, and scalar results are replaced by extracted lanes. Unmatched operations stay scalar.
+5. The driver verifies transformed IR and writes the result. Use LLVM's verifier and `llc` to validate and inspect native lowering; a failed verifier or output write returns a nonzero error.
+
+| Choice | Current implementation and rationale | Alternative and cost or reconsideration point |
+| --- | --- | --- |
+| Basic-block scope | Candidates stay within one block, where local dominance and independence are tractable. | Cross-block packing needs broader scheduling and legality analysis beyond this pass's scope. |
+| Integer `add`, `sub`, `mul` only | Matching opcode, type, and flags keep the rewrite semantics narrow. | Floating-point and mixed operations introduce different legality and cost rules. |
+| Bounded exact search | Subset dynamic programming optimizes pairing for up to 16 operations. | Unbounded search grows exponentially; greedy is used above the cap at lower selection quality. |
+| Target cost gate | TargetTransformInfo compares scalar and vector arithmetic and accounts for computed operand insertion. | A fixed instruction-count heuristic ignores target variation; the current estimate still omits some costs and does not promise a speedup. |
+| Scalar loads remain foldable | The pass avoids charging explicit lane insertion for loads, preserving the supported load-pair path. | Explicitly materializing every lane is easier to model but may prevent native folded loads. |
+
+These rationales are inferred from the implementation. The insertion-cost estimate is incomplete, and hardware counters were unavailable in the hosted campaign. Timing results do not establish general performance or superiority to LLVM's upstream SLP.
+
+<a id="slp"></a>
+
+<details><summary>What is SLP vectorization?</summary>
+
+Superword-level parallelism vectorization combines independent scalar operations into one operation over vector lanes. This pass packs pairs of same-opcode integer operations within one basic block; it does not build whole-function vector schedules.
+
+</details>
+
+<a id="dominance"></a>
+
+<details><summary>What is dominance?</summary>
+
+An instruction dominates another when every control-flow path to the latter passes through the former. The pass checks that candidate operands are available before both scalar operations.
+
+</details>
+
+<a id="target-transform-info"></a>
+
+<details><summary>What is TargetTransformInfo?</summary>
+
+TargetTransformInfo is LLVM's interface for target-specific transformation costs and capabilities. This pass uses its arithmetic and vector insertion costs; invalid target costs conservatively reject a pair.
+
+</details>
+
+<a id="lane-insertion"></a>
+
+<details><summary>What is lane insertion?</summary>
+
+Lane insertion places scalar values into positions of a vector before a vector operation. The pass subtracts estimated insertion cost for computed operands because those instructions can erase arithmetic savings.
+
+</details>
+
+<a id="subset-dynamic-programming"></a>
+
+<details><summary>What is subset dynamic programming?</summary>
+
+Subset dynamic programming caches the best result for each remaining set of candidates. The pass uses a 16-candidate ceiling because the state space grows exponentially.
+
+</details>
+
+<a id="greedy-pairing"></a>
+
+<details><summary>What is greedy pairing?</summary>
+
+Greedy pairing chooses eligible neighboring operations as it scans the block. The pass uses it above 16 candidates and exposes it directly with `--greedy`; it can miss nonadjacent pairings that exact search finds.
+
+</details>
+
+<a id="what-it-does"></a>
+
 ## What it does
 
 The pass considers independent `add`, `sub`, and `mul` instructions with the same integer type in one basic block. It checks operand dominance and matching operation flags before packing, then replaces scalar results with vector lanes. Exact mode uses bounded subset dynamic programming for up to 16 candidates in a block; larger blocks use the adjacent-pair greedy fallback. `--greedy` selects the baseline directly.
