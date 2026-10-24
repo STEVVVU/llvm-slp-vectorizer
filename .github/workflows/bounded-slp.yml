@@ -35,6 +35,22 @@ jobs:
           mkdir "$sdk"
           tar --use-compress-program='zstd --decompress --long=30' \
             --extract --file "$archive" --directory "$sdk" --strip-components=1
+          filecheck="$RUNNER_TEMP/filecheck-23.1.4"
+          mkdir "$filecheck"
+          source=https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-23.1.4/llvm
+          curl --fail --location --retry 3 "$source/utils/FileCheck/FileCheck.cpp" --output "$filecheck/main.cpp"
+          curl --fail --location --retry 3 "$source/lib/FileCheck/FileCheck.cpp" --output "$filecheck/library.cpp"
+          curl --fail --location --retry 3 "$source/lib/FileCheck/FileCheckImpl.h" --output "$filecheck/FileCheckImpl.h"
+          echo "3c6568b68c5c6d6ec8b9a2acb378a6949c9f5004ae009d2597b7f760f944f320  $filecheck/main.cpp" | sha256sum --check
+          echo "74beb71f22b14d95a4f73cd0a809906d8aaea08a0365ff5ee29315ab4c349e58  $filecheck/library.cpp" | sha256sum --check
+          echo "bb611f9088c8eda289ee77ec6777bda0f4d06a34084dba56c21b127d7491f49a  $filecheck/FileCheckImpl.h" | sha256sum --check
+          read -r -a cxxflags <<< "$("$sdk/bin/llvm-config" --cxxflags)"
+          read -r -a ldflags <<< "$("$sdk/bin/llvm-config" --ldflags)"
+          read -r -a llvmlibs <<< "$("$sdk/bin/llvm-config" --link-static --libs support)"
+          read -r -a systemlibs <<< "$("$sdk/bin/llvm-config" --link-static --system-libs)"
+          g++ "${cxxflags[@]}" "$filecheck/main.cpp" "$filecheck/library.cpp" \
+            -o "$sdk/bin/FileCheck" "${ldflags[@]}" "${llvmlibs[@]}" "${systemlibs[@]}"
+          "$sdk/bin/FileCheck" --version
           test ! -e /usr/lib/llvm-23
           sudo ln -s "$sdk" /usr/lib/llvm-23
           test "$(/usr/lib/llvm-23/bin/llvm-config --version)" = 23.1.4
