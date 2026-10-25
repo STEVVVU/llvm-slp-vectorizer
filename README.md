@@ -12,159 +12,43 @@ This project adds a small, real LLVM function pass for packing independent scala
 - [Verification evidence](#verification-evidence)
 - [Verification skill](.agents/skills/verify-bounded-slp/SKILL.md)
 
-## Implementation techniques
-
-This section covers the active bounded-SLP pass, its two host paths, and the maintained IR and native-code gates. Historical `llvm-tutor` examples and benchmark measurement orchestration are outside this scope. Rationale is inferred from the current implementation.
-
-| Subsystem | Techniques | Code |
-| --- | --- | --- |
-| Candidate collection | [Same-block candidate collection](#technique-p19-candidate-scan) | [`BoundedSLP.cpp`](lib/BoundedSLP.cpp#L228) |
-| Pair legality | [Opcode, type, flag, dependence, and dominance checks](#technique-p19-legality) | [`BoundedSLP.cpp`](lib/BoundedSLP.cpp#L27), [`BoundedSLP.ll`](test/BoundedSLP.ll) |
-| Profitability | [TTI arithmetic savings and insertion-cost adjustment](#technique-p19-target-cost) | [`BoundedSLP.cpp`](lib/BoundedSLP.cpp#L52) |
-| Pair selection | [Adjacent greedy pairing](#technique-p19-greedy-pairing); [bounded subset search and tie-breaks](#technique-p19-bounded-dp) | [`BoundedSLP.cpp`](lib/BoundedSLP.cpp#L87) |
-| Vector operands | [Constant-vector folding and scalar lane insertion](#technique-p19-vector-operands) | [`BoundedSLP.cpp`](lib/BoundedSLP.cpp#L192) |
-| Scalar result replacement | [Vector emission, extraction, and use replacement](#technique-p19-vector-rewrite) | [`BoundedSLP.cpp`](lib/BoundedSLP.cpp#L214) |
-| Hosting and validation | [Plugin and standalone hosts with verifier and native-code gates](#technique-p19-dual-host-verification) | [`BoundedSLP.cpp`](lib/BoundedSLP.cpp#L254), [`BoundedSLPDriver.cpp`](tools/BoundedSLPDriver.cpp#L33), [`verify.ps1`](scripts/verify.ps1#L100), [CI workflow](.github/workflows/bounded-slp.yml#L71) |
-
-<a id="technique-p19-candidate-scan"></a>
-
-<details>
-<summary>Same-block candidate collection</summary>
-
-**Mechanism.** `BoundedSLP::run` visits each defined function one basic block at a time. It collects binary integer `add`, `sub`, and `mul` instructions whose widths are 8 through 64 bits. It does not form opcode buckets at collection time; the pair checks compare operations later.
-
-**Example.** In `test/BoundedSLP.ll`, the two `i32 add` operations in `slp_add2` enter the same candidate list. The following add that consumes their results is also collected, then pair legality decides whether it can match another operation.
-
-**Why here.** The pass rewrites local pairs and does not schedule operations across control-flow blocks.
-
-**Tradeoffs.** Floating point, memory instructions, other integer widths, and cross-block groups never enter this candidate set.
-
-**Code and ownership.** [`BoundedSLP.cpp`](lib/BoundedSLP.cpp#L228) `BoundedSLP::run`; extension.
-
-</details>
-
-<a id="technique-p19-legality"></a>
-
-<details>
-<summary>Pair legality by opcode, type, flags, dependence, and dominance</summary>
-
-**Mechanism.** `sameOperation` requires equal opcodes, equal integer types, widths from 8 through 64 bits, and equal raw optional operation data, which keeps arithmetic flags aligned. `independent` rejects a pair when either operation directly consumes the other's result. `inputsDominate` asks the dominator tree whether every instruction operand is available before the earlier operation. These checks run before selection.
-
-**Example.** `mismatched_flags` in the fixture keeps `add nsw` and plain `add` separate. A value defined after the earlier candidate also fails the dominance check.
-
-**Why here.** The rewrite moves both operations to the earlier position, so their inputs and arithmetic semantics must remain valid there.
-
-**Tradeoffs.** This checks direct pair dependence and operand dominance. It does not build memory dependence or cross-block schedules.
-
-**Code and ownership.** [`BoundedSLP.cpp`](lib/BoundedSLP.cpp#L27) `sameOperation`, [#L35](lib/BoundedSLP.cpp#L35) `inputsDominate`, and [#L47](lib/BoundedSLP.cpp#L47) `independent`; extension.
-
-</details>
-
-<a id="technique-p19-target-cost"></a>
-
-<details>
-<summary>TTI arithmetic savings with insertion-cost adjustment</summary>
-
-**Mechanism.** `arithmeticSavings` compares the target cost of two scalar arithmetic operations with one two-lane vector operation. It subtracts `TargetTransformInfo` insertion costs for instruction-produced operands, except loads, whose adjacent accesses may fold during native lowering. Constants and other non-instruction values add no insertion estimate. An invalid queried cost or savings at or below zero rejects the pair.
-
-**Example.** The `computed_lane_cost` fixture remains scalar when materializing computed operands erases the estimated arithmetic savings.
-
-**Why here.** Target costs let the same IR transformation use the selected target's cost interface.
-
-**Tradeoffs.** The estimate omits result extraction costs, register pressure, and scheduling. It is a local heuristic, not a runtime guarantee.
-
-**Code and ownership.** [`BoundedSLP.cpp`](lib/BoundedSLP.cpp#L52) `arithmeticSavings`; LLVM TTI is inherited, while this pass's comparison and adjustments are extension code.
-
-</details>
-
-<a id="technique-p19-greedy-pairing"></a>
-
-<details>
-<summary>Adjacent greedy pairing</summary>
-
-**Mechanism.** `chooseGreedy` scans the collected candidate list from left to right. It considers only adjacent entries, checks legality and positive estimated savings, emits each accepted pair, then skips its second entry. Exact mode also calls this path when a block has more than 16 candidates; the driver exposes it directly with `--greedy`.
-
-**Example.** If entries 0 and 1 pass the checks, the scan pairs them and resumes at entry 2. It never revisits entry 0 to pair it with entry 2.
-
-**Why here.** This gives the pass a bounded fallback when exact search would exceed its fixed candidate limit, plus a direct baseline mode.
-
-**Tradeoffs.** It can miss profitable nonadjacent pairs or a better combination of adjacent choices.
-
-**Code and ownership.** [`BoundedSLP.cpp`](lib/BoundedSLP.cpp#L87) `chooseGreedy` and [#L245](lib/BoundedSLP.cpp#L245) mode selection; [`BoundedSLPDriver.cpp`](tools/BoundedSLPDriver.cpp#L30) option; extension.
-
-</details>
-
-<a id="technique-p19-bounded-dp"></a>
-
-<details>
-<summary>Bounded subset dynamic programming and score tie-breaks</summary>
-
-**Mechanism.** Through 16 candidates, `chooseBounded` records legal profitable pairs as edges and memoizes the best score for each remaining-operation bit mask. Each state may leave its first candidate scalar or pair it with a legal remaining partner. The score first maximizes summed TTI savings, then pair count, then minimizes the separate `insertionEstimate`. Equal scores keep the first choice encountered in candidate order.
-
-**Example.** The search can consider candidates 1 and 5 together even when intervening entries prevent adjacent greedy pairing.
-
-**Why here.** The fixed limit permits nonadjacent choices for small blocks while routing larger blocks to the greedy path.
-
-**Tradeoffs.** Exact search allocates up to one cached choice per subset. Above 16, the pass does not compare alternative matchings. The tie-break estimate counts two inserts per operand unless both values are constants; it is not TTI's insertion-cost query.
-
-**Code and ownership.** [`BoundedSLP.cpp`](lib/BoundedSLP.cpp#L104) `chooseBounded`, [#L125](lib/BoundedSLP.cpp#L125) `better`, and [#L78](lib/BoundedSLP.cpp#L78) `insertionEstimate`; extension.
-
-</details>
-
-<a id="technique-p19-vector-operands"></a>
-
-<details>
-<summary>Constant-vector folding and scalar lane insertion</summary>
-
-**Mechanism.** `vectorize` builds a two-lane operand vector for each binary operand position. If both lane values are constants, it creates a `ConstantVector` directly. Otherwise it starts with a poison vector and inserts the two scalar values at lane 0 and lane 1 before emitting the packed operation.
-
-**Example.** The two constant operands in `constant_pair` can form constant vectors; computed or loaded scalar values take the `insertelement` path in IR.
-
-**Why here.** Both paths create the vector operands required by the selected pair, while the constant path avoids creating an instruction that constant folding could eliminate.
-
-**Tradeoffs.** Insertions remain explicit in IR for nonconstant pairs. Native lowering may fold some loads, but this pass does not explicitly vectorize memory operations.
-
-**Code and ownership.** [`BoundedSLP.cpp`](lib/BoundedSLP.cpp#L192) `vectorize`; LLVM IRBuilder and IR value APIs are inherited dependencies, and the construction policy is extension code.
-
-</details>
-
-<a id="technique-p19-vector-rewrite"></a>
-
-<details>
-<summary>Vector operation emission and scalar-use replacement</summary>
-
-**Mechanism.** The pass inserts one vector binary operation at the earlier scalar instruction, copies the matching operation flags, and uses the earlier instruction's debug location. It extracts lanes 0 and 1, redirects each original scalar result's uses to the matching extraction, then erases both scalar instructions.
-
-**Example.** A selected pair of independent `i32 mul` instructions becomes one `<2 x i32> mul` and two scalar `extractelement` values.
-
-**Why here.** This keeps downstream scalar users and control flow intact while replacing the selected arithmetic pair.
-
-**Tradeoffs.** The extracted scalars and any operand insertions remain in IR for later LLVM passes to simplify or lower. Unselected operations stay scalar.
-
-**Code and ownership.** [`BoundedSLP.cpp`](lib/BoundedSLP.cpp#L214) through [#L224](lib/BoundedSLP.cpp#L224) `vectorize`; extension using LLVM IR APIs.
-
-</details>
-
-<a id="technique-p19-dual-host-verification"></a>
-
-<details>
-<summary>Plugin and standalone hosts with verifier and native-code gates</summary>
-
-**Mechanism.** The pass registers `bounded-slp` and `bounded-slp-greedy` with LLVM's new pass manager. On Windows, CMake builds `slp-opt` with a standalone host because the pinned SDK uses static LLVM libraries; other configured builds use the shared plugin. The driver parses and verifies input IR, runs the pass on defined functions, verifies output, and writes it. Maintained checks also lower output with `llc` and require packed integer addition in native assembly.
-
-**Example.** The Windows verification script checks both IR modes with LLVM `opt`, then emits SSE2 assembly and requires `paddd`. The CI path loads the plugin into `opt`, uses `-verify-each`, and checks the same native instruction.
-
-**Why here.** The host choice accommodates the supported LLVM linkage, and verifier gates catch malformed transformed IR before native inspection.
-
-**Tradeoffs.** The native gate proves code generation contains a packed add for the fixture; it does not prove a runtime speedup. Windows validates the standalone path, while CI validates plugin loading.
-
-**Code and ownership.** [`BoundedSLP.cpp`](lib/BoundedSLP.cpp#L254) `getBoundedSLPPluginInfo`, [`BoundedSLPDriver.cpp`](tools/BoundedSLPDriver.cpp#L33) `main`, [`lib/CMakeLists.txt`](lib/CMakeLists.txt#L45), [`verify.ps1`](scripts/verify.ps1#L100), and [CI workflow](.github/workflows/bounded-slp.yml#L71); the pass and host selection are extensions, while LLVM pass hosting, verification, and code generation are inherited APIs and tools.
-
-</details>
-
 ## Architecture and execution guide
 
+### Subsystem map
+
+Select a subsystem in the diagram to open its techniques, tradeoffs, and code references. The numbered links provide the same navigation. This map groups components; the execution diagrams show their runtime flow.
+
+```mermaid
+flowchart LR
+  system["Bounded LLVM SLP<br/>Vectorizer"]
+  system --> s1["1. Candidate collection"]
+  click s1 href "https://github.com/STEVVVU/llvm-slp-vectorizer#subsystem-candidate-collection" "Explore Candidate collection" _top
+  system --> s2["2. Pair legality"]
+  click s2 href "https://github.com/STEVVVU/llvm-slp-vectorizer#subsystem-pair-legality" "Explore Pair legality" _top
+  system --> s3["3. Profitability estimation"]
+  click s3 href "https://github.com/STEVVVU/llvm-slp-vectorizer#subsystem-profitability-estimation" "Explore Profitability estimation" _top
+  system --> s4["4. Pair selection"]
+  click s4 href "https://github.com/STEVVVU/llvm-slp-vectorizer#subsystem-pair-selection" "Explore Pair selection" _top
+  system --> s5["5. Vector operand construction"]
+  click s5 href "https://github.com/STEVVVU/llvm-slp-vectorizer#subsystem-vector-operand-construction" "Explore Vector operand construction" _top
+  system --> s6["6. Scalar result replacement"]
+  click s6 href "https://github.com/STEVVVU/llvm-slp-vectorizer#subsystem-scalar-result-replacement" "Explore Scalar result replacement" _top
+  system --> s7["7. Pass hosting and validation<br/>gates"]
+  click s7 href "https://github.com/STEVVVU/llvm-slp-vectorizer#subsystem-pass-hosting-and-validation-gates" "Explore Pass hosting and validation gates" _top
+```
+
+1. [Candidate collection](#subsystem-candidate-collection)
+2. [Pair legality](#subsystem-pair-legality)
+3. [Profitability estimation](#subsystem-profitability-estimation)
+4. [Pair selection](#subsystem-pair-selection)
+5. [Vector operand construction](#subsystem-vector-operand-construction)
+6. [Scalar result replacement](#subsystem-scalar-result-replacement)
+7. [Pass hosting and validation gates](#subsystem-pass-hosting-and-validation-gates)
+
 The project adds a bounded [SLP vectorization](#slp) function pass and standalone driver to the inherited `llvm-tutor` examples. LLVM supplies IR, analyses, target costs, pass infrastructure, and code generation; the new pass selects and rewrites eligible integer operations in a basic block. It is a bounded pair-packing pass, not LLVM's full SLP vectorizer.
+
+<details>
+<summary>Expand flow diagram 1</summary>
 
 ```mermaid
 flowchart LR
@@ -175,7 +59,12 @@ flowchart LR
   E --> F["Native code"]
 ```
 
+</details>
+
 The driver parses and verifies the module, invokes the pass, verifies its output, and writes IR. LLVM tools then verify and lower the transformed module; plugin registration exists for shared LLVM hosts, while the documented Windows path uses the standalone driver.
+
+<details>
+<summary>Expand flow diagram 2</summary>
 
 ```mermaid
 flowchart TD
@@ -195,6 +84,8 @@ flowchart TD
     H --> I["Replace scalar uses and verify IR"]
   end
 ```
+
+</details>
 
 [Dominance](#dominance) and other legality checks precede profitability. Exact search is bounded to 16 candidates per block; larger blocks use the greedy fallback. Unsupported or unprofitable operations remain scalar, and the cost estimate omits some construction and extraction costs.
 
@@ -273,6 +164,271 @@ Greedy pairing chooses eligible neighboring operations as it scans the block. Th
 </details>
 
 <a id="what-it-does"></a>
+
+## Implementation techniques
+
+This section covers the active bounded-SLP pass, its two host paths, and the maintained IR and native-code gates. Historical `llvm-tutor` examples and benchmark measurement orchestration are outside this scope. Rationale is inferred from the current implementation.
+
+<details>
+<summary>Full technique index</summary>
+
+| Subsystem | Techniques | Code |
+| --- | --- | --- |
+| Candidate collection | [Same-block candidate collection](#technique-p19-candidate-scan) | [`BoundedSLP.cpp`](lib/BoundedSLP.cpp#L228) |
+| Pair legality | [Opcode, type, flag, dependence, and dominance checks](#technique-p19-legality) | [`BoundedSLP.cpp`](lib/BoundedSLP.cpp#L27), [`BoundedSLP.ll`](test/BoundedSLP.ll) |
+| Profitability | [TTI arithmetic savings and insertion-cost adjustment](#technique-p19-target-cost) | [`BoundedSLP.cpp`](lib/BoundedSLP.cpp#L52) |
+| Pair selection | [Adjacent greedy pairing](#technique-p19-greedy-pairing); [bounded subset search and tie-breaks](#technique-p19-bounded-dp) | [`BoundedSLP.cpp`](lib/BoundedSLP.cpp#L87) |
+| Vector operands | [Constant-vector folding and scalar lane insertion](#technique-p19-vector-operands) | [`BoundedSLP.cpp`](lib/BoundedSLP.cpp#L192) |
+| Scalar result replacement | [Vector emission, extraction, and use replacement](#technique-p19-vector-rewrite) | [`BoundedSLP.cpp`](lib/BoundedSLP.cpp#L214) |
+| Hosting and validation | [Plugin and standalone hosts with verifier and native-code gates](#technique-p19-dual-host-verification) | [`BoundedSLP.cpp`](lib/BoundedSLP.cpp#L254), [`BoundedSLPDriver.cpp`](tools/BoundedSLPDriver.cpp#L33), [`verify.ps1`](scripts/verify.ps1#L100), [CI workflow](.github/workflows/bounded-slp.yml#L71) |
+
+</details>
+
+<a id="subsystem-candidate-collection"></a>
+
+### 1. Candidate collection
+
+[Back to the subsystem map](#architecture-and-execution-guide).
+
+**Code.** [`lib/BoundedSLP.cpp`](lib/BoundedSLP.cpp).
+
+**Techniques.** [Same-block candidate collection](#technique-p19-candidate-scan).
+
+<a id="technique-p19-candidate-scan"></a>
+
+<details>
+<summary>Same-block candidate collection</summary>
+
+**Mechanism.** `BoundedSLP::run` visits each defined function one basic block at a time. It collects binary integer `add`, `sub`, and `mul` instructions whose widths are 8 through 64 bits. It does not form opcode buckets at collection time; the pair checks compare operations later.
+
+**Example.** In `test/BoundedSLP.ll`, the two `i32 add` operations in `slp_add2` enter the same candidate list. The following add that consumes their results is also collected, then pair legality decides whether it can match another operation.
+
+**Why here.** The pass rewrites local pairs and does not schedule operations across control-flow blocks.
+
+**Tradeoffs.** Floating point, memory instructions, other integer widths, and cross-block groups never enter this candidate set.
+
+**Code and ownership.** [`BoundedSLP.cpp`](lib/BoundedSLP.cpp#L228) `BoundedSLP::run`; extension.
+
+
+
+**Used in.** [Candidate collection](#subsystem-candidate-collection). [Back to the subsystem map](#architecture-and-execution-guide).
+
+</details>
+
+<a id="subsystem-pair-legality"></a>
+
+### 2. Pair legality
+
+[Back to the subsystem map](#architecture-and-execution-guide).
+
+**Code.** [`lib/BoundedSLP.cpp`](lib/BoundedSLP.cpp), [`test/BoundedSLP.ll`](test/BoundedSLP.ll).
+
+**Techniques.** [Pair legality by opcode, type, flags, dependence, and dominance](#technique-p19-legality).
+
+**Related concepts.** [dominance](#dominance).
+
+<a id="technique-p19-legality"></a>
+
+<details>
+<summary>Pair legality by opcode, type, flags, dependence, and dominance</summary>
+
+**Mechanism.** `sameOperation` requires equal opcodes, equal integer types, widths from 8 through 64 bits, and equal raw optional operation data, which keeps arithmetic flags aligned. `independent` rejects a pair when either operation directly consumes the other's result. `inputsDominate` asks the dominator tree whether every instruction operand is available before the earlier operation. These checks run before selection.
+
+**Example.** `mismatched_flags` in the fixture keeps `add nsw` and plain `add` separate. A value defined after the earlier candidate also fails the dominance check.
+
+**Why here.** The rewrite moves both operations to the earlier position, so their inputs and arithmetic semantics must remain valid there.
+
+**Tradeoffs.** This checks direct pair dependence and operand dominance. It does not build memory dependence or cross-block schedules.
+
+**Code and ownership.** [`BoundedSLP.cpp`](lib/BoundedSLP.cpp#L27) `sameOperation`, [#L35](lib/BoundedSLP.cpp#L35) `inputsDominate`, and [#L47](lib/BoundedSLP.cpp#L47) `independent`; extension.
+
+
+
+**Used in.** [Pair legality](#subsystem-pair-legality). [Back to the subsystem map](#architecture-and-execution-guide).
+
+</details>
+
+<a id="subsystem-profitability-estimation"></a>
+
+### 3. Profitability estimation
+
+[Back to the subsystem map](#architecture-and-execution-guide).
+
+**Code.** [`lib/BoundedSLP.cpp`](lib/BoundedSLP.cpp), [`test/BoundedSLP.ll`](test/BoundedSLP.ll).
+
+**Techniques.** [TTI arithmetic savings with insertion-cost adjustment](#technique-p19-target-cost).
+
+**Related concepts.** [TargetTransformInfo](#target-transform-info).
+
+<a id="technique-p19-target-cost"></a>
+
+<details>
+<summary>TTI arithmetic savings with insertion-cost adjustment</summary>
+
+**Mechanism.** `arithmeticSavings` compares the target cost of two scalar arithmetic operations with one two-lane vector operation. It subtracts `TargetTransformInfo` insertion costs for instruction-produced operands, except loads, whose adjacent accesses may fold during native lowering. Constants and other non-instruction values add no insertion estimate. An invalid queried cost or savings at or below zero rejects the pair.
+
+**Example.** The `computed_lane_cost` fixture remains scalar when materializing computed operands erases the estimated arithmetic savings.
+
+**Why here.** Target costs let the same IR transformation use the selected target's cost interface.
+
+**Tradeoffs.** The estimate omits result extraction costs, register pressure, and scheduling. It is a local heuristic, not a runtime guarantee.
+
+**Code and ownership.** [`BoundedSLP.cpp`](lib/BoundedSLP.cpp#L52) `arithmeticSavings`; LLVM TTI is inherited, while this pass's comparison and adjustments are extension code.
+
+
+
+**Used in.** [Profitability estimation](#subsystem-profitability-estimation). [Back to the subsystem map](#architecture-and-execution-guide).
+
+</details>
+
+<a id="subsystem-pair-selection"></a>
+
+### 4. Pair selection
+
+[Back to the subsystem map](#architecture-and-execution-guide).
+
+**Code.** [`lib/BoundedSLP.cpp`](lib/BoundedSLP.cpp), [`include/BoundedSLP.h`](include/BoundedSLP.h).
+
+**Techniques.** [Adjacent greedy pairing](#technique-p19-greedy-pairing), [Bounded subset dynamic programming and score tie-breaks](#technique-p19-bounded-dp).
+
+**Related concepts.** [subset dynamic programming](#subset-dynamic-programming), [greedy pairing](#greedy-pairing).
+
+<a id="technique-p19-greedy-pairing"></a>
+
+<details>
+<summary>Adjacent greedy pairing</summary>
+
+**Mechanism.** `chooseGreedy` scans the collected candidate list from left to right. It considers only adjacent entries, checks legality and positive estimated savings, emits each accepted pair, then skips its second entry. Exact mode also calls this path when a block has more than 16 candidates; the driver exposes it directly with `--greedy`.
+
+**Example.** If entries 0 and 1 pass the checks, the scan pairs them and resumes at entry 2. It never revisits entry 0 to pair it with entry 2.
+
+**Why here.** This gives the pass a bounded fallback when exact search would exceed its fixed candidate limit, plus a direct baseline mode.
+
+**Tradeoffs.** It can miss profitable nonadjacent pairs or a better combination of adjacent choices.
+
+**Code and ownership.** [`BoundedSLP.cpp`](lib/BoundedSLP.cpp#L87) `chooseGreedy` and [#L245](lib/BoundedSLP.cpp#L245) mode selection; [`BoundedSLPDriver.cpp`](tools/BoundedSLPDriver.cpp#L30) option; extension.
+
+
+
+**Used in.** [Pair selection](#subsystem-pair-selection). [Back to the subsystem map](#architecture-and-execution-guide).
+
+</details>
+
+<a id="technique-p19-bounded-dp"></a>
+
+<details>
+<summary>Bounded subset dynamic programming and score tie-breaks</summary>
+
+**Mechanism.** Through 16 candidates, `chooseBounded` records legal profitable pairs as edges and memoizes the best score for each remaining-operation bit mask. Each state may leave its first candidate scalar or pair it with a legal remaining partner. The score first maximizes summed TTI savings, then pair count, then minimizes the separate `insertionEstimate`. Equal scores keep the first choice encountered in candidate order.
+
+**Example.** The search can consider candidates 1 and 5 together even when intervening entries prevent adjacent greedy pairing.
+
+**Why here.** The fixed limit permits nonadjacent choices for small blocks while routing larger blocks to the greedy path.
+
+**Tradeoffs.** Exact search allocates up to one cached choice per subset. Above 16, the pass does not compare alternative matchings. The tie-break estimate counts two inserts per operand unless both values are constants; it is not TTI's insertion-cost query.
+
+**Code and ownership.** [`BoundedSLP.cpp`](lib/BoundedSLP.cpp#L104) `chooseBounded`, [#L125](lib/BoundedSLP.cpp#L125) `better`, and [#L78](lib/BoundedSLP.cpp#L78) `insertionEstimate`; extension.
+
+
+
+**Used in.** [Pair selection](#subsystem-pair-selection). [Back to the subsystem map](#architecture-and-execution-guide).
+
+</details>
+
+<a id="subsystem-vector-operand-construction"></a>
+
+### 5. Vector operand construction
+
+[Back to the subsystem map](#architecture-and-execution-guide).
+
+**Code.** [`lib/BoundedSLP.cpp`](lib/BoundedSLP.cpp).
+
+**Techniques.** [Constant-vector folding and scalar lane insertion](#technique-p19-vector-operands).
+
+**Related concepts.** [lane insertion](#lane-insertion).
+
+<a id="technique-p19-vector-operands"></a>
+
+<details>
+<summary>Constant-vector folding and scalar lane insertion</summary>
+
+**Mechanism.** `vectorize` builds a two-lane operand vector for each binary operand position. If both lane values are constants, it creates a `ConstantVector` directly. Otherwise it starts with a poison vector and inserts the two scalar values at lane 0 and lane 1 before emitting the packed operation.
+
+**Example.** The two constant operands in `constant_pair` can form constant vectors; computed or loaded scalar values take the `insertelement` path in IR.
+
+**Why here.** Both paths create the vector operands required by the selected pair, while the constant path avoids creating an instruction that constant folding could eliminate.
+
+**Tradeoffs.** Insertions remain explicit in IR for nonconstant pairs. Native lowering may fold some loads, but this pass does not explicitly vectorize memory operations.
+
+**Code and ownership.** [`BoundedSLP.cpp`](lib/BoundedSLP.cpp#L192) `vectorize`; LLVM IRBuilder and IR value APIs are inherited dependencies, and the construction policy is extension code.
+
+
+
+**Used in.** [Vector operand construction](#subsystem-vector-operand-construction). [Back to the subsystem map](#architecture-and-execution-guide).
+
+</details>
+
+<a id="subsystem-scalar-result-replacement"></a>
+
+### 6. Scalar result replacement
+
+[Back to the subsystem map](#architecture-and-execution-guide).
+
+**Code.** [`lib/BoundedSLP.cpp`](lib/BoundedSLP.cpp).
+
+**Techniques.** [Vector operation emission and scalar-use replacement](#technique-p19-vector-rewrite).
+
+<a id="technique-p19-vector-rewrite"></a>
+
+<details>
+<summary>Vector operation emission and scalar-use replacement</summary>
+
+**Mechanism.** The pass inserts one vector binary operation at the earlier scalar instruction, copies the matching operation flags, and uses the earlier instruction's debug location. It extracts lanes 0 and 1, redirects each original scalar result's uses to the matching extraction, then erases both scalar instructions.
+
+**Example.** A selected pair of independent `i32 mul` instructions becomes one `<2 x i32> mul` and two scalar `extractelement` values.
+
+**Why here.** This keeps downstream scalar users and control flow intact while replacing the selected arithmetic pair.
+
+**Tradeoffs.** The extracted scalars and any operand insertions remain in IR for later LLVM passes to simplify or lower. Unselected operations stay scalar.
+
+**Code and ownership.** [`BoundedSLP.cpp`](lib/BoundedSLP.cpp#L214) through [#L224](lib/BoundedSLP.cpp#L224) `vectorize`; extension using LLVM IR APIs.
+
+
+
+**Used in.** [Scalar result replacement](#subsystem-scalar-result-replacement). [Back to the subsystem map](#architecture-and-execution-guide).
+
+</details>
+
+<a id="subsystem-pass-hosting-and-validation-gates"></a>
+
+### 7. Pass hosting and validation gates
+
+[Back to the subsystem map](#architecture-and-execution-guide).
+
+**Code.** [`lib/BoundedSLP.cpp`](lib/BoundedSLP.cpp), [`tools/BoundedSLPDriver.cpp`](tools/BoundedSLPDriver.cpp), [`lib/CMakeLists.txt`](lib/CMakeLists.txt), [`scripts/verify.ps1`](scripts/verify.ps1), [`.github/workflows/bounded-slp.yml`](.github/workflows/bounded-slp.yml).
+
+**Techniques.** [Dual pass hosting with verifier and native-code gates](#technique-p19-dual-host-verification).
+
+<a id="technique-p19-dual-host-verification"></a>
+
+<details>
+<summary>Plugin and standalone hosts with verifier and native-code gates</summary>
+
+**Mechanism.** The pass registers `bounded-slp` and `bounded-slp-greedy` with LLVM's new pass manager. On Windows, CMake builds `slp-opt` with a standalone host because the pinned SDK uses static LLVM libraries; other configured builds use the shared plugin. The driver parses and verifies input IR, runs the pass on defined functions, verifies output, and writes it. Maintained checks also lower output with `llc` and require packed integer addition in native assembly.
+
+**Example.** The Windows verification script checks both IR modes with LLVM `opt`, then emits SSE2 assembly and requires `paddd`. The CI path loads the plugin into `opt`, uses `-verify-each`, and checks the same native instruction.
+
+**Why here.** The host choice accommodates the supported LLVM linkage, and verifier gates catch malformed transformed IR before native inspection.
+
+**Tradeoffs.** The native gate proves code generation contains a packed add for the fixture; it does not prove a runtime speedup. Windows validates the standalone path, while CI validates plugin loading.
+
+**Code and ownership.** [`BoundedSLP.cpp`](lib/BoundedSLP.cpp#L254) `getBoundedSLPPluginInfo`, [`BoundedSLPDriver.cpp`](tools/BoundedSLPDriver.cpp#L33) `main`, [`lib/CMakeLists.txt`](lib/CMakeLists.txt#L45), [`verify.ps1`](scripts/verify.ps1#L100), and [CI workflow](.github/workflows/bounded-slp.yml#L71); the pass and host selection are extensions, while LLVM pass hosting, verification, and code generation are inherited APIs and tools.
+
+
+
+**Used in.** [Pass hosting and validation gates](#subsystem-pass-hosting-and-validation-gates). [Back to the subsystem map](#architecture-and-execution-guide).
+
+</details>
 
 ## What it does
 
