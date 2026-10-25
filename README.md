@@ -14,6 +14,310 @@ This project adds a small, real LLVM function pass for packing independent scala
 
 ## Architecture and execution guide
 
+<!-- execution-flow:start -->
+### Execution flow
+
+Start with the primary path, then expand a detailed workflow. Select a numbered node to see its operation, implementation techniques, and source. Solid arrows show the named control, data, or lifecycle handoff; dotted arrows show error paths. Separate entry points are named in each workflow.
+
+<a id="review-walkthrough"></a>
+
+#### Walk through one concrete example
+
+Run the standalone bounded SLP pass on a defined LLVM function containing independent profitable i32 additions in one basic block.
+
+**Trace.** [Load function and select pass mode](#flow-step-host-input) → [Skip declarations](#flow-step-skip-declaration) → [Collect eligible scalar operations](#flow-step-collect) → [Choose greedy or bounded selection](#flow-step-select-mode) → [Filter candidate pairs](#flow-step-legality) → [Estimate arithmetic savings](#flow-step-cost) → [Pack disjoint profitable pairs](#flow-step-pack) → [Build two-lane operands](#flow-step-operands).
+
+**Result and boundary.** Eligible disjoint scalar pairs are packed into two-lane vector operations and written to the requested IR output; blocks over 16 candidates fall back to greedy selection, and the separate native verification gates are not runtime pass behavior.
+
+<details>
+<summary>Implementation decisions to explain</summary>
+
+**Why require matching opcode, type, flags, and independence before pairing?** Those checks preserve scalar operation semantics and ensure the pair can share one vector instruction; they reject otherwise similar operations when their properties differ.
+
+[Pair legality by opcode, type, flags, dependence, and dominance](#technique-p19-legality).
+
+**Why use bounded subset selection up to 16 candidates and greedy pairing above that?** Subset search chooses a best disjoint pairing within a small bounded candidate set, while greedy fallback keeps larger blocks tractable; the larger-block choice may miss a better global pairing.
+
+[Bounded subset dynamic programming and score tie-breaks](#technique-p19-bounded-dp) · [Adjacent greedy pairing](#technique-p19-greedy-pairing).
+
+</details>
+
+#### Primary execution flow
+
+The function pass collects eligible same-block integer arithmetic, estimates pair profitability, selects disjoint pairs, rewrites them, and returns transformed IR through either independent host. Maintained verification branches check IR validity and native lowering.
+
+```mermaid
+flowchart TD
+    n1["1. Load function and select pass<br/>mode"]
+    click n1 href "https://github.com/STEVVVU/llvm-slp-vectorizer#flow-step-host-input" "Open step, techniques, and source" _top
+    n2["2. Skip declarations"]
+    click n2 href "https://github.com/STEVVVU/llvm-slp-vectorizer#flow-step-skip-declaration" "Open step, techniques, and source" _top
+    n3["3. Collect eligible scalar<br/>operations"]
+    click n3 href "https://github.com/STEVVVU/llvm-slp-vectorizer#flow-step-collect" "Open step, techniques, and source" _top
+    n4["4. Filter candidate pairs"]
+    click n4 href "https://github.com/STEVVVU/llvm-slp-vectorizer#flow-step-legality" "Open step, techniques, and source" _top
+    n5["5. Estimate arithmetic savings"]
+    click n5 href "https://github.com/STEVVVU/llvm-slp-vectorizer#flow-step-cost" "Open step, techniques, and source" _top
+    n6["6. Choose greedy or bounded<br/>selection"]
+    click n6 href "https://github.com/STEVVVU/llvm-slp-vectorizer#flow-step-select-mode" "Open step, techniques, and source" _top
+    n7["7. Pack disjoint profitable<br/>pairs"]
+    click n7 href "https://github.com/STEVVVU/llvm-slp-vectorizer#flow-step-pack" "Open step, techniques, and source" _top
+    n8["8. Build two-lane operands"]
+    click n8 href "https://github.com/STEVVVU/llvm-slp-vectorizer#flow-step-operands" "Open step, techniques, and source" _top
+    n9["9. Emit vector operation and<br/>replace scalar uses"]
+    click n9 href "https://github.com/STEVVVU/llvm-slp-vectorizer#flow-step-replace" "Open step, techniques, and source" _top
+    n10["10. Write transformed IR"]
+    click n10 href "https://github.com/STEVVVU/llvm-slp-vectorizer#flow-step-output" "Open step, techniques, and source" _top
+    n1 -->|"defined or declaration function enters<br/>pass"| n2
+    n2 -->|"defined function"| n3
+    n3 -->|"candidate list per basic block"| n6
+    n4 -->|"pair acceptance needs legality and<br/>positive savings"| n5
+    n5 -->|"bounded mode retains legal<br/>positive-savings edges"| n7
+    n6 -->|"selected selector checks candidate<br/>pairs"| n4
+    n5 -->|"greedy legal positive-savings pairs"| n8
+    n7 -->|"reconstructed disjoint pairs"| n8
+    n8 -->|"two vector operands built"| n9
+    n9 -->|"pass completes with changed or<br/>unchanged module"| n10
+```
+
+**Detailed workflows.** [Standalone or plugin pass runtime](#flow-workflow-pass-runtime) · [IR and native verification gates](#flow-workflow-verification-gates) · [CI verification entry](#flow-workflow-ci-entry).
+
+<a id="flow-workflow-pass-runtime"></a>
+
+<details>
+<summary>Standalone or plugin pass runtime</summary>
+
+Standalone driver and plugin are separate entrypoints into the function pass. This workflow covers declaration skip, candidate discovery, legality, cost, selection, vector rewrite and result publication.
+
+```mermaid
+flowchart TD
+    n1["1. Load function and select pass<br/>mode"]
+    click n1 href "https://github.com/STEVVVU/llvm-slp-vectorizer#flow-step-host-input" "Open step, techniques, and source" _top
+    n2["2. Skip declarations"]
+    click n2 href "https://github.com/STEVVVU/llvm-slp-vectorizer#flow-step-skip-declaration" "Open step, techniques, and source" _top
+    n3["3. Collect eligible scalar<br/>operations"]
+    click n3 href "https://github.com/STEVVVU/llvm-slp-vectorizer#flow-step-collect" "Open step, techniques, and source" _top
+    n4["4. Filter candidate pairs"]
+    click n4 href "https://github.com/STEVVVU/llvm-slp-vectorizer#flow-step-legality" "Open step, techniques, and source" _top
+    n5["5. Estimate arithmetic savings"]
+    click n5 href "https://github.com/STEVVVU/llvm-slp-vectorizer#flow-step-cost" "Open step, techniques, and source" _top
+    n6["6. Choose greedy or bounded<br/>selection"]
+    click n6 href "https://github.com/STEVVVU/llvm-slp-vectorizer#flow-step-select-mode" "Open step, techniques, and source" _top
+    n7["7. Pack disjoint profitable<br/>pairs"]
+    click n7 href "https://github.com/STEVVVU/llvm-slp-vectorizer#flow-step-pack" "Open step, techniques, and source" _top
+    n8["8. Build two-lane operands"]
+    click n8 href "https://github.com/STEVVVU/llvm-slp-vectorizer#flow-step-operands" "Open step, techniques, and source" _top
+    n9["9. Emit vector operation and<br/>replace scalar uses"]
+    click n9 href "https://github.com/STEVVVU/llvm-slp-vectorizer#flow-step-replace" "Open step, techniques, and source" _top
+    n10["10. Write transformed IR"]
+    click n10 href "https://github.com/STEVVVU/llvm-slp-vectorizer#flow-step-output" "Open step, techniques, and source" _top
+    n1 -->|"function enters run"| n2
+    n2 -->|"defined function"| n3
+    n3 -->|"same-block operations"| n6
+    n4 -->|"pair acceptance needs legality and<br/>positive savings"| n5
+    n5 -->|"bounded mode retains legal<br/>positive-savings edges"| n7
+    n6 -->|"selected selector checks candidate<br/>pairs"| n4
+    n5 -->|"greedy legal positive-savings pairs"| n8
+    n7 -->|"DP reconstructed pairs"| n8
+    n8 -->|"constructed lane vectors"| n9
+    n9 -->|"transformed function module"| n10
+```
+
+</details>
+
+<a id="flow-workflow-verification-gates"></a>
+
+<details>
+<summary>IR and native verification gates</summary>
+
+The maintained verification script exercises standalone exact and greedy output, verifies IR, checks a boundary input, lowers to native x86 code, and runs a native harness; CI invokes the maintained gate.
+
+```mermaid
+flowchart TD
+    n11["11. Verify transformed IR"]
+    click n11 href "https://github.com/STEVVVU/llvm-slp-vectorizer#flow-step-ir-check" "Open step, techniques, and source" _top
+    n12["12. Check native lowering and<br/>differential harness"]
+    click n12 href "https://github.com/STEVVVU/llvm-slp-vectorizer#flow-step-native-check" "Open step, techniques, and source" _top
+    n11 -->|"IR and structural checks succeed"| n12
+```
+
+</details>
+
+<a id="flow-workflow-ci-entry"></a>
+
+<details>
+<summary>CI verification entry</summary>
+
+Independent CI orchestration invokes its Linux IR and native-lowering commands. It is not called by the native verifier.
+
+```mermaid
+flowchart TD
+    n13["13. Run maintained verification<br/>workflow"]
+    click n13 href "https://github.com/STEVVVU/llvm-slp-vectorizer#flow-step-ci-gate" "Open step, techniques, and source" _top
+```
+
+</details>
+
+#### Steps, techniques, and source
+
+These source traces cover the active scope below. They explain implementation behavior; benchmark results and their limits remain in the measurement sections.
+
+<a id="flow-step-host-input"></a>
+
+##### 1. Load function and select pass mode
+
+**Component.** BoundedSLP driver and pass plugin. The standalone driver parses input IR and runs BoundedSLP, with --greedy selecting greedy pairing; the plugin registers bounded-slp and bounded-slp-greedy pipeline names. These are separate hosts for the same pass, not a runtime dispatch between them.
+
+**Techniques at this step.** [Dual pass hosting with verifier and native-code gates](#technique-p19-dual-host-verification).
+
+**Source.** [`tools/BoundedSLPDriver.cpp:33`](https://github.com/STEVVVU/llvm-slp-vectorizer/blob/main/tools/BoundedSLPDriver.cpp#L33) · [`lib/BoundedSLP.cpp:254`](https://github.com/STEVVVU/llvm-slp-vectorizer/blob/main/lib/BoundedSLP.cpp#L254). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-skip-declaration"></a>
+
+##### 2. Skip declarations
+
+**Component.** BoundedSLP::run. A declaration returns PreservedAnalyses::all() immediately, so it does not enter block scanning.
+
+Pass control branch, not a separate optimization technique.
+
+**Source.** [`lib/BoundedSLP.cpp:228`](https://github.com/STEVVVU/llvm-slp-vectorizer/blob/main/lib/BoundedSLP.cpp#L228). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-collect"></a>
+
+##### 3. Collect eligible scalar operations
+
+**Component.** BoundedSLP::run. For each defined function, obtain DominatorTree and TargetTransformInfo, then collect add, sub, and mul integer binary operators of widths 8 through 64 within each basic block. Other operations and types are not candidates.
+
+**Techniques at this step.** [Same-block candidate collection](#technique-p19-candidate-scan).
+
+**Source.** [`lib/BoundedSLP.cpp:233`](https://github.com/STEVVVU/llvm-slp-vectorizer/blob/main/lib/BoundedSLP.cpp#L233). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-legality"></a>
+
+##### 4. Filter candidate pairs
+
+**Component.** sameOperation / independent / inputsDominate. A pair must have matching opcode, type, integer width policy, and raw optional flags; neither operation may consume the other's result, and instruction operands must dominate the earlier operation. Illegal pairs are omitted.
+
+**Techniques at this step.** [Pair legality by opcode, type, flags, dependence, and dominance](#technique-p19-legality).
+
+**Source.** [`lib/BoundedSLP.cpp:27`](https://github.com/STEVVVU/llvm-slp-vectorizer/blob/main/lib/BoundedSLP.cpp#L27) · [`lib/BoundedSLP.cpp:35`](https://github.com/STEVVVU/llvm-slp-vectorizer/blob/main/lib/BoundedSLP.cpp#L35) · [`lib/BoundedSLP.cpp:47`](https://github.com/STEVVVU/llvm-slp-vectorizer/blob/main/lib/BoundedSLP.cpp#L47). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-cost"></a>
+
+##### 5. Estimate arithmetic savings
+
+**Component.** arithmeticSavings. Query TTI for two scalar arithmetic costs and one fixed two-lane vector cost; invalid costs or nonpositive savings reject the pair. The estimate subtracts lane insertion costs for non-instruction, non-load operands; it is a target cost-model estimate, not a measured extraction-cost claim.
+
+**Techniques at this step.** [TTI arithmetic savings with insertion-cost adjustment](#technique-p19-target-cost).
+
+**Source.** [`lib/BoundedSLP.cpp:52`](https://github.com/STEVVVU/llvm-slp-vectorizer/blob/main/lib/BoundedSLP.cpp#L52). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-select-mode"></a>
+
+##### 6. Choose greedy or bounded selection
+
+**Component.** BoundedSLP::run. Greedy mode checks adjacent candidates, accepts legal positive-savings pairs, then skips the consumed neighbor. Default mode runs bounded subset selection; when a block has more than 16 candidates it falls back to the greedy chooser.
+
+**Techniques at this step.** [Adjacent greedy pairing](#technique-p19-greedy-pairing) · [Bounded subset dynamic programming and score tie-breaks](#technique-p19-bounded-dp).
+
+**Source.** [`lib/BoundedSLP.cpp:87`](https://github.com/STEVVVU/llvm-slp-vectorizer/blob/main/lib/BoundedSLP.cpp#L87) · [`lib/BoundedSLP.cpp:104`](https://github.com/STEVVVU/llvm-slp-vectorizer/blob/main/lib/BoundedSLP.cpp#L104) · [`lib/BoundedSLP.cpp:245`](https://github.com/STEVVVU/llvm-slp-vectorizer/blob/main/lib/BoundedSLP.cpp#L245). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-pack"></a>
+
+##### 7. Pack disjoint profitable pairs
+
+**Component.** chooseBounded. For at most 16 candidates, build legal pair edges with savings and insertion estimate, then memoize subset solutions. Select maximum savings, then maximum pair count, then minimum insertion estimate; reconstruct disjoint pairs from cached choices.
+
+**Techniques at this step.** [Bounded subset dynamic programming and score tie-breaks](#technique-p19-bounded-dp).
+
+**Source.** [`lib/BoundedSLP.cpp:125`](https://github.com/STEVVVU/llvm-slp-vectorizer/blob/main/lib/BoundedSLP.cpp#L125) · [`lib/BoundedSLP.cpp:104`](https://github.com/STEVVVU/llvm-slp-vectorizer/blob/main/lib/BoundedSLP.cpp#L104). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-operands"></a>
+
+##### 8. Build two-lane operands
+
+**Component.** vectorize. At the earlier scalar instruction, form constant vectors when both lane values are constants; otherwise start with poison and insert each scalar lane. No memory operation is packed by this path.
+
+**Techniques at this step.** [Constant-vector folding and scalar lane insertion](#technique-p19-vector-operands).
+
+**Source.** [`lib/BoundedSLP.cpp:192`](https://github.com/STEVVVU/llvm-slp-vectorizer/blob/main/lib/BoundedSLP.cpp#L192). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-replace"></a>
+
+##### 9. Emit vector operation and replace scalar uses
+
+**Component.** vectorize. Emit the matching vector binary operation, copy IR flags and debug location, extract both result lanes, replace uses of the original scalar operations, and erase them. The pass reports no analyses preserved if any pair changed; otherwise it preserves all.
+
+**Techniques at this step.** [Vector operation emission and scalar-use replacement](#technique-p19-vector-rewrite).
+
+**Source.** [`lib/BoundedSLP.cpp:192`](https://github.com/STEVVVU/llvm-slp-vectorizer/blob/main/lib/BoundedSLP.cpp#L192) · [`lib/BoundedSLP.cpp:228`](https://github.com/STEVVVU/llvm-slp-vectorizer/blob/main/lib/BoundedSLP.cpp#L228). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-output"></a>
+
+##### 10. Write transformed IR
+
+**Component.** BoundedSLPDriver. The standalone driver writes the resulting module to the requested output path; driver errors return a nonzero result. Plugin hosting leaves output in the caller's LLVM pipeline.
+
+**Techniques at this step.** [Dual pass hosting with verifier and native-code gates](#technique-p19-dual-host-verification).
+
+**Source.** [`tools/BoundedSLPDriver.cpp:33`](https://github.com/STEVVVU/llvm-slp-vectorizer/blob/main/tools/BoundedSLPDriver.cpp#L33). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-ir-check"></a>
+
+##### 11. Verify transformed IR
+
+**Component.** scripts/verify.ps1 and LLVM opt. The maintained Drive phase runs standalone exact and greedy passes and invokes opt -passes=verify on each transformed module; it also checks expected vector counts, rejected flag/type cases, volatile-load preservation, and the 16-candidate boundary. This is a verification path, not production pass behavior.
+
+**Techniques at this step.** [Dual pass hosting with verifier and native-code gates](#technique-p19-dual-host-verification).
+
+**Source.** [`scripts/verify.ps1:100`](https://github.com/STEVVVU/llvm-slp-vectorizer/blob/main/scripts/verify.ps1#L100) · [`test/BoundedSLP.ll:1`](https://github.com/STEVVVU/llvm-slp-vectorizer/blob/main/test/BoundedSLP.ll#L1). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-native-check"></a>
+
+##### 12. Check native lowering and differential harness
+
+**Component.** scripts/verify.ps1 / llc / native harness. Drive lowers exact output to x86 assembly and object with SSE2, requires a packed integer add and checks the scalar baseline disassembly, then builds and runs the native differential/performance harness. These are maintained gates, not evidence of general speedup.
+
+**Techniques at this step.** [Dual pass hosting with verifier and native-code gates](#technique-p19-dual-host-verification).
+
+**Source.** [`scripts/verify.ps1:100`](https://github.com/STEVVVU/llvm-slp-vectorizer/blob/main/scripts/verify.ps1#L100). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-ci-gate"></a>
+
+##### 13. Run maintained verification workflow
+
+**Component.** bounded-slp GitHub Actions workflow. The workflow invokes the repository's verification script on its configured platform; the standalone/plugin build definitions provide the corresponding pass artifacts. CI does not establish behavior beyond its executed checks.
+
+**Techniques at this step.** [Dual pass hosting with verifier and native-code gates](#technique-p19-dual-host-verification).
+
+**Source.** [`.github/workflows/bounded-slp.yml:71`](https://github.com/STEVVVU/llvm-slp-vectorizer/blob/main/.github/workflows/bounded-slp.yml#L71) · [`lib/CMakeLists.txt:45`](https://github.com/STEVVVU/llvm-slp-vectorizer/blob/main/lib/CMakeLists.txt#L45). [Back to execution flow](#execution-flow).
+
+<details>
+<summary>Scope and subsystem coverage</summary>
+
+Bounded integer basic-block SLP transformation through its standalone driver or LLVM plugin, plus maintained IR verifier and native SIMD gates.
+
+- **Candidate collection.** Defined-function basic blocks collect only add/sub/mul integer operations from 8 through 64 bits. [Step 3](#flow-step-collect).
+- **Pair legality.** Matching op/type/flags, independence and input dominance gate pair edges. [Step 4](#flow-step-legality).
+- **Profitability estimation.** TTI arithmetic costs plus insertion adjustment produce estimated savings; no extraction-cost claim. [Step 5](#flow-step-cost).
+- **Pair selection.** Adjacent greedy selection, bounded DP through 16 candidates, deterministic score tie-breaks, and greedy fallback above the limit. [Step 6](#flow-step-select-mode), [Step 7](#flow-step-pack).
+- **Vector operand construction.** Constant lanes fold into constant vectors; other inputs use scalar lane insertions. [Step 8](#flow-step-operands).
+- **Scalar result replacement.** Vector op/extracts replace original uses and erase original scalar operations. [Step 9](#flow-step-replace).
+- **Pass hosting and validation gates.** Driver and plugin are independent hosts; maintained IR and native checks execute in verification/CI paths. [Step 1](#flow-step-host-input), [Step 10](#flow-step-output), [Step 11](#flow-step-ir-check), [Step 12](#flow-step-native-check), [Step 13](#flow-step-ci-gate).
+
+Outside this flow audit:
+
+- `lib/* upstream llvm-tutor passes and tests`. Preserved tutorial examples do not participate in bounded-slp.
+- `scripts/benchmark.py and benchmark kernels`. Comparative measurement orchestration is outside the pass and correctness gates; no measured speedup is claimed.
+- `LLVM internals and target backends`. LLVM APIs and target lowering are dependencies, not authored repository mechanisms.
+
+</details>
+
+<!-- execution-flow:end -->
+
+<details>
+<summary>Subsystem technique index</summary>
+
 ### Subsystem map
 
 Select a subsystem in the diagram to open its techniques, tradeoffs, and code references. The numbered links provide the same navigation. This map groups components; the execution diagrams show their runtime flow.
@@ -46,6 +350,8 @@ flowchart LR
 7. [Pass hosting and validation gates](#subsystem-pass-hosting-and-validation-gates)
 
 The project adds a bounded [SLP vectorization](#slp) function pass and standalone driver to the inherited `llvm-tutor` examples. LLVM supplies IR, analyses, target costs, pass infrastructure, and code generation; the new pass selects and rewrites eligible integer operations in a basic block. It is a bounded pair-packing pass, not LLVM's full SLP vectorizer.
+
+</details>
 
 <details>
 <summary>Expand flow diagram 1</summary>
